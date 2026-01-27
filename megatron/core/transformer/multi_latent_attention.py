@@ -137,6 +137,7 @@ class MultiLatentAttention(Attention):
 
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
+                rotary_percent=self.config.rotary_percent,
                 rotary_base=self.config.rotary_base,
                 scaling_factor=self.config.rotary_scaling_factor,
                 original_max_position_embeddings=self.config.original_max_position_embeddings,
