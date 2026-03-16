@@ -147,6 +147,340 @@ class MLPSubmodules:
     """
 
 
+class MatformerMLP(MegatronModule):
+    """Matformer MLP with nested Feed Forward Network (FFN) blocks.
+
+    During training, jointly optimizes parameters across multiple FFN granularities
+    (different hidden sizes). Each granularity uses the first ``g`` neurons of the FFN
+    hidden dimension, enabling sub-model extraction without re-training.
+
+    The forward pass computes outputs for every granularity and returns their average,
+    which propagates gradients through all nested weight subsets simultaneously.
+
+    At inference time, set ``active_ffn_size`` to any of the trained granularities to
+    obtain a smaller, faster model that reuses the trained prefix weights.
+
+    Limitations:
+      - Does not support ``bias_activation_fusion`` or ``use_te_activation_func`` during
+        multi-granularity training (falls back to non-fused path).
+      - Gated linear units (SwiGLU/GEGLU) are supported via explicit chunk-and-gate logic.
+      - All granularities must be divisible by ``tensor_model_parallel_size``.
+
+    Reference: https://arxiv.org/abs/2310.07707
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: MLPSubmodules,
+        is_expert: bool = False,
+        input_size: Optional[int] = None,
+        ffn_hidden_size: Optional[int] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        super().__init__(config=config)
+        self.config: TransformerConfig = config
+        self.input_size = input_size if input_size is not None else self.config.hidden_size
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+
+        if ffn_hidden_size is None:
+            ffn_hidden_size = not_none(self.config.ffn_hidden_size)
+
+        self._full_ffn_hidden_size = ffn_hidden_size
+        tp_size = self.config.tensor_model_parallel_size
+
+        # Build and validate granularities.
+        if config.matformer_ffn_granularities is not None:
+            granularities = sorted(config.matformer_ffn_granularities)
+            # Ensure the full FFN size is always included as the last granularity.
+            if granularities[-1] != ffn_hidden_size:
+                granularities.append(ffn_hidden_size)
+            for g in granularities:
+                if g % tp_size != 0:
+                    raise ValueError(
+                        f"Matformer granularity {g} must be divisible by "
+                        f"tensor_model_parallel_size {tp_size}."
+                    )
+                if g > ffn_hidden_size:
+                    raise ValueError(
+                        f"Matformer granularity {g} exceeds ffn_hidden_size {ffn_hidden_size}."
+                    )
+            self.matformer_granularities = granularities
+        else:
+            self.matformer_granularities = None
+
+        # ``active_ffn_size`` controls inference-time granularity (default: full model).
+        self.active_ffn_size: int = ffn_hidden_size
+
+        # Build fc1 / fc2 using the *full* FFN hidden size (weights are shared across all
+        # granularities; nested sub-models reuse the weight prefix).
+        fc1_out_size = ffn_hidden_size
+        if self.config.gated_linear_unit:
+            fc1_out_size *= 2
+            fc1_stride = 2
+            if self.config.use_kitchen:
+                fc1_stride = 1
+        else:
+            fc1_stride = 1
+
+        use_latent_size = (self.config.moe_latent_size is not None) and is_expert
+        self.linear_fc1 = submodules.linear_fc1(
+            self.input_size if not use_latent_size else not_none(self.config.moe_latent_size),
+            fc1_out_size,
+            config=self.config,
+            init_method=not_none(self.config.init_method),
+            gather_output=False,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=True,
+            is_expert=is_expert,
+            tp_comm_buffer_name="fc1",
+            tp_group=tp_group,
+            stride=fc1_stride,
+        )
+
+        if self.config.use_te_activation_func and not (submodules.activation_func is None):
+            self.activation_func = apply_module(submodules.activation_func(config=self.config))
+        else:
+            self.activation_func = self.config.activation_func
+
+        self.linear_fc2 = submodules.linear_fc2(
+            not_none(self.config.ffn_hidden_size),
+            not_none(
+                self.config.hidden_size if not use_latent_size else self.config.moe_latent_size
+            ),
+            config=self.config,
+            init_method=not_none(self.config.output_layer_init_method),
+            bias=self.config.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True,
+            is_expert=is_expert,
+            tp_comm_buffer_name="fc2",
+            tp_group=tp_group,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _apply_activation_non_fused(
+        self,
+        intermediate: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        local_gran: int,
+    ) -> torch.Tensor:
+        """Apply activation for one granularity slice using the non-fused path.
+
+        Returns a tensor of shape ``(..., local_gran)``.
+        """
+        tp_size = self.config.tensor_model_parallel_size
+        full_local = self._full_ffn_hidden_size // tp_size
+
+        if bias is not None:
+            intermediate = intermediate + bias
+
+        if self.config.gated_linear_unit:
+            # fc1 output is interleaved [gate_0..gate_{full_local-1}, up_0..up_{full_local-1}]
+            # after torch.chunk(intermediate, 2, dim=-1).
+            x_glu = intermediate[..., :local_gran]
+            x_linear = intermediate[..., full_local : full_local + local_gran]
+            if (val := self.config.activation_func_clamp_value) is not None:
+                x_glu = x_glu.clamp(min=None, max=val)
+                x_linear = x_linear.clamp(min=-val, max=val)
+            return self.config.activation_func(x_glu) * (
+                x_linear + self.config.glu_linear_offset
+            )
+        else:
+            return self.config.activation_func(intermediate[..., :local_gran])
+
+    def _forward_granularity(
+        self,
+        intermediate: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        local_gran: int,
+        full_local: int,
+        per_token_scale: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward through fc2 for a single granularity.
+
+        ``intermediate`` is the raw fc1 output (pre-activation).
+        The activated slice is zero-padded back to ``full_local`` before fc2, so
+        fc2 weight columns ``[local_gran:]`` receive zero gradients.
+        """
+        activated = self._apply_activation_non_fused(intermediate, bias, local_gran)
+
+        if per_token_scale is not None:
+            original_dtype = activated.dtype
+            activated = activated * per_token_scale.unsqueeze(-1)
+            activated = activated.to(original_dtype)
+
+        # Zero-pad to full FFN size so RowParallelLinear fc2 can be reused unchanged.
+        if local_gran < full_local:
+            padded = torch.zeros(
+                *activated.shape[:-1], full_local,
+                dtype=activated.dtype,
+                device=activated.device,
+            )
+            padded[..., :local_gran] = activated
+        else:
+            padded = activated
+
+        return apply_module(self.linear_fc2)(padded)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        per_token_scale: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        """Forward pass.
+
+        During training with ``matformer_granularities`` set, computes outputs for every
+        granularity and returns their average, jointly training all nested sub-models.
+        During inference (or when granularities are not configured), uses ``active_ffn_size``
+        to select a single granularity.
+        """
+        tp_size = self.config.tensor_model_parallel_size
+        full_local = self._full_ffn_hidden_size // tp_size
+
+        nvtx_range_push(suffix="linear_fc1")
+        intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
+        nvtx_range_pop(suffix="linear_fc1")
+
+        # ---- Multi-granularity training path ----
+        if self.training and self.matformer_granularities is not None:
+            nvtx_range_push(suffix="matformer_multi_gran")
+            outputs = []
+            for gran in self.matformer_granularities:
+                local_gran = gran // tp_size
+                out, out_bias = self._forward_granularity(
+                    intermediate_parallel, bias_parallel, local_gran, full_local, per_token_scale
+                )
+                outputs.append((out, out_bias))
+
+            # Average across granularities so every nested sub-model is jointly optimised.
+            avg_output = torch.stack([o[0] for o in outputs]).mean(0)
+            avg_bias: Optional[torch.Tensor] = None
+            if outputs[0][1] is not None:
+                avg_bias = torch.stack([o[1] for o in outputs]).mean(0)
+            nvtx_range_pop(suffix="matformer_multi_gran")
+            return avg_output, avg_bias
+
+        # ---- Single-granularity path (inference or no Matformer config) ----
+        local_active = self.active_ffn_size // tp_size
+
+        nvtx_range_push(suffix="activation")
+        if local_active < full_local:
+            # Use selected sub-model granularity.
+            output, output_bias = self._forward_granularity(
+                intermediate_parallel, bias_parallel, local_active, full_local, per_token_scale
+            )
+            nvtx_range_pop(suffix="activation")
+            return output, output_bias
+
+        # Full-size path — keep original fused kernels when available.
+        if self.config.use_te_activation_func:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
+            if per_token_scale is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+        elif self.config.bias_activation_fusion:
+            if per_token_scale is not None:
+                if self.activation_func == F.silu and self.config.gated_linear_unit:
+                    intermediate_parallel = weighted_bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                    )
+                else:
+                    raise ValueError(
+                        "MatformerMLP only supports weighted swiglu fusion with per_token_scale."
+                    )
+            else:
+                if self.activation_func == F.gelu:
+                    if self.config.gated_linear_unit:
+                        intermediate_parallel = bias_geglu_impl(
+                            intermediate_parallel, bias_parallel
+                        )
+                    else:
+                        assert self.config.add_bias_linear is True
+                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.cpu_offloading
+                        and self.config.cpu_offloading_activations
+                        and HAVE_TE,
+                    )
+                else:
+                    raise ValueError("Only support fusion of gelu and swiglu")
+        else:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            if self.config.gated_linear_unit:
+
+                def glu(x):
+                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                    if (val := self.config.activation_func_clamp_value) is not None:
+                        x_glu = x_glu.clamp(min=None, max=val)
+                        x_linear = x_linear.clamp(min=-val, max=val)
+                    return self.config.activation_func(x_glu) * (
+                        x_linear + self.config.glu_linear_offset
+                    )
+
+                intermediate_parallel = glu(intermediate_parallel)
+            else:
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+
+            if per_token_scale is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+        nvtx_range_pop(suffix="activation")
+
+        nvtx_range_push(suffix="linear_fc2")
+        output, output_bias = apply_module(self.linear_fc2)(
+            cast(torch.Tensor, intermediate_parallel)
+        )
+        nvtx_range_pop(suffix="linear_fc2")
+
+        if per_token_scale is not None and output_bias is not None:
+            output += output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)
+            output_bias = None
+
+        return output, output_bias
+
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """Return the sharded state dictionary of the module."""
+        sharded_state_dict = {}
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        for name, module in self._modules.items():
+            sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
+            if self.config.gated_linear_unit and name == "linear_fc1":
+                for k, v in sub_sd.items():
+                    if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
+                        sub_sd[k] = apply_swiglu_sharded_factory(
+                            v, sharded_offsets, singleton_local_shards
+                        )
+            sharded_state_dict.update(sub_sd)
+        return sharded_state_dict
+
+    def backward_dw(self):
+        self.linear_fc2.backward_dw()
+        self.linear_fc1.backward_dw()
+
+
 class MLP(MegatronModule):
     """
     MLP will take the input with h hidden state, project it to 4*h

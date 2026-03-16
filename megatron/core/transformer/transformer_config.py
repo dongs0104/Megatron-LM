@@ -145,6 +145,32 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size
     if not provided."""
 
+    matformer_ffn_granularities: Optional[List[int]] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {
+                "nargs": "+",
+                "type": int,
+                "default": None,
+                "help": (
+                    "List of FFN hidden sizes for Matformer nested FFN training "
+                    "(https://arxiv.org/abs/2310.07707). Trains a single model that can be "
+                    "sliced into multiple smaller models. Each value must be <= ffn_hidden_size "
+                    "and divisible by tensor_model_parallel_size. The largest value is "
+                    "automatically set to ffn_hidden_size. "
+                    "Example: --matformer-ffn-granularities 1024 2048 4096"
+                ),
+            }
+        },
+    )
+    """List of FFN hidden sizes for Matformer nested FFN training.
+    Enables training a single model that can be sliced into multiple smaller models.
+    Each value must be <= ffn_hidden_size and divisible by tensor_model_parallel_size.
+    The largest value should equal ffn_hidden_size (it is automatically appended if missing).
+    Example: [1024, 2048, 4096] with ffn_hidden_size=4096 trains with three nested granularities.
+    Reference: https://arxiv.org/abs/2310.07707
+    """
+
     kv_channels: Optional[int] = None
     """Projection weights dimension in multi-head attention. This is set to hidden_size //
     num_attention_heads if not provided."""

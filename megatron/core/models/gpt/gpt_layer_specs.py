@@ -12,7 +12,7 @@ from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_ba
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.mlp import MLP, MLPSubmodules, MatformerMLP
 from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
     MLASelfAttention,
@@ -463,6 +463,84 @@ def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core."""
     return ModuleSpec(
         module=TransformerLayer, submodules=get_gpt_layer_local_submodules(*args, **kwargs)
+    )
+
+
+def get_gpt_matformer_layer_local_spec(
+    normalization: str = "LayerNorm",
+    qk_layernorm: bool = False,
+    qk_l2_norm: bool = False,
+) -> ModuleSpec:
+    """Layer spec for Matformer (Matrix-embedded Transformer) using pure Megatron-Core modules.
+
+    Substitutes the standard MLP with :class:`~megatron.core.transformer.mlp.MatformerMLP`,
+    which jointly trains nested FFN granularities specified via
+    ``TransformerConfig.matformer_ffn_granularities``.
+
+    Args:
+        normalization: ``"LayerNorm"`` (default) or ``"RMSNorm"``.
+        qk_layernorm: Apply per-head layer-norm to Q/K projections.
+        qk_l2_norm: Apply L2-norm to Q/K projections (mutually exclusive with qk_layernorm).
+
+    Returns:
+        :class:`~megatron.core.transformer.spec_utils.ModuleSpec` for a
+        :class:`~megatron.core.transformer.transformer_layer.TransformerLayer` whose MLP
+        sub-module is ``MatformerMLP``.
+
+    Example::
+
+        config = TransformerConfig(
+            ...,
+            ffn_hidden_size=4096,
+            matformer_ffn_granularities=[1024, 2048, 4096],
+        )
+        spec = get_gpt_matformer_layer_local_spec()
+        model = GPTModel(config=config, transformer_layer_spec=spec, ...)
+    """
+    backend = LocalSpecProvider()
+    if normalization == "RMSNorm":
+        layer_norm = backend.layer_norm(rms_norm=True, for_qk=False, has_residual=True)
+        qk_norm = backend.layer_norm(rms_norm=True, for_qk=True)
+    else:
+        layer_norm = backend.layer_norm(rms_norm=False, for_qk=False, has_residual=True)
+        qk_norm = backend.layer_norm(rms_norm=False, for_qk=True)
+
+    mlp_spec = ModuleSpec(
+        module=MatformerMLP,
+        submodules=MLPSubmodules(
+            linear_fc1=backend.column_parallel_linear(),
+            linear_fc2=backend.row_parallel_linear(),
+        ),
+    )
+
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=layer_norm,
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=backend.column_parallel_linear(),
+                    core_attention=backend.core_attention(),
+                    linear_proj=backend.row_parallel_linear(),
+                    q_layernorm=(
+                        L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                    ),
+                    k_layernorm=(
+                        L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                    ),
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=layer_norm,
+            mlp=mlp_spec,
+            mlp_bda=get_bias_dropout_add,
+            sharded_state_dict_keys_map={
+                "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+                "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
+            },
+        ),
     )
 
 
