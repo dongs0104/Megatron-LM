@@ -171,6 +171,16 @@ class TransformerConfig(ModelParallelConfig):
     Reference: https://arxiv.org/abs/2310.07707
     """
 
+    matformer_training_strategy: str = "all"
+    """Training strategy for Matformer nested FFN.
+    - "all": compute outputs for every granularity and average (faithful to paper,
+      but ~N× slower in MLP where N = number of granularities).
+    - "random": sample one random granularity per forward pass (no overhead,
+      stochastic approximation of the full objective).
+    - "random_pair": sample two granularities — always the full model plus one
+      random smaller granularity (good balance of quality and speed).
+    """
+
     kv_channels: Optional[int] = None
     """Projection weights dimension in multi-head attention. This is set to hidden_size //
     num_attention_heads if not provided."""

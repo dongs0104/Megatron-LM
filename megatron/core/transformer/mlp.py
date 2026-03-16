@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import random
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -353,19 +354,40 @@ class MatformerMLP(MegatronModule):
         # ---- Multi-granularity training path ----
         if self.training and self.matformer_granularities is not None:
             nvtx_range_push(suffix="matformer_multi_gran")
+            strategy = self.config.matformer_training_strategy
+
+            # Select which granularities to use this step.
+            if strategy == "random":
+                # One random granularity — zero overhead vs standard MLP.
+                selected = [random.choice(self.matformer_granularities)]
+            elif strategy == "random_pair":
+                # Full model + one random smaller granularity.
+                full = self.matformer_granularities[-1]
+                smaller = [g for g in self.matformer_granularities if g < full]
+                if smaller:
+                    selected = [random.choice(smaller), full]
+                else:
+                    selected = [full]
+            else:
+                # "all" — faithful to the paper: every granularity every step.
+                selected = self.matformer_granularities
+
             outputs = []
-            for gran in self.matformer_granularities:
+            for gran in selected:
                 local_gran = gran // tp_size
                 out, out_bias = self._forward_granularity(
                     intermediate_parallel, bias_parallel, local_gran, full_local, per_token_scale
                 )
                 outputs.append((out, out_bias))
 
-            # Average across granularities so every nested sub-model is jointly optimised.
-            avg_output = torch.stack([o[0] for o in outputs]).mean(0)
-            avg_bias: Optional[torch.Tensor] = None
-            if outputs[0][1] is not None:
-                avg_bias = torch.stack([o[1] for o in outputs]).mean(0)
+            # Average across selected granularities.
+            if len(outputs) == 1:
+                avg_output, avg_bias = outputs[0]
+            else:
+                avg_output = torch.stack([o[0] for o in outputs]).mean(0)
+                avg_bias: Optional[torch.Tensor] = None
+                if outputs[0][1] is not None:
+                    avg_bias = torch.stack([o[1] for o in outputs]).mean(0)
             nvtx_range_pop(suffix="matformer_multi_gran")
             return avg_output, avg_bias
 
